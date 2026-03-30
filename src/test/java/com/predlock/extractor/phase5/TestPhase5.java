@@ -44,7 +44,7 @@ class TestPhase5 {
                 List.of("OrderService.placeOrder", "inventoryRepo.findByProductId"));
 
         DeadlockAnalyzerInputGenerator gen = new DeadlockAnalyzerInputGenerator();
-        String json = gen.generate(List.of(rt), 2);
+        String json = gen.generate(List.of(rt), 2, "deadlock-analyzer-input.json");
         JsonNode root = MAPPER.readTree(json);
 
         JsonNode txs = root.get("transactions");
@@ -83,7 +83,7 @@ class TestPhase5 {
         ResolvedTransaction rt = makeTransaction("OrderService.update", "REQUIRED", false,
                 List.of(op), List.of("OrderService.update"));
 
-        String json = new DeadlockAnalyzerInputGenerator().generate(List.of(rt), 3);
+        String json = new DeadlockAnalyzerInputGenerator().generate(List.of(rt), 3, "deadlock-analyzer-input.json");
         JsonNode txs = MAPPER.readTree(json).get("transactions");
         assertEquals(3, txs.size());
         assertEquals("T1_update", txs.get(0).get("id").asText());
@@ -100,7 +100,7 @@ class TestPhase5 {
         ResolvedTransaction rt = makeTransaction("S.m", "REQUIRED", false,
                 List.of(op1, op2), List.of("S.m"));
 
-        String json = new DeadlockAnalyzerInputGenerator().generate(List.of(rt), 1);
+        String json = new DeadlockAnalyzerInputGenerator().generate(List.of(rt), 1, "deadlock-analyzer-input.json");
         JsonNode stmts = MAPPER.readTree(json).get("transactions").get(0).get("statements");
         assertEquals("res1", stmts.get(0).get("resultReference").asText());
         assertEquals("res2", stmts.get(1).get("resultReference").asText());
@@ -108,7 +108,7 @@ class TestPhase5 {
 
     @Test
     void testEmptyTransactions() throws Exception {
-        String json = new DeadlockAnalyzerInputGenerator().generate(List.of(), 2);
+        String json = new DeadlockAnalyzerInputGenerator().generate(List.of(), 2, "deadlock-analyzer-input.json");
         JsonNode root = MAPPER.readTree(json);
         assertEquals(0, root.get("transactions").size());
     }
@@ -122,7 +122,7 @@ class TestPhase5 {
         ResolvedTransaction rt = makeTransaction("S.m", "REQUIRED", false,
                 List.of(op), List.of("S.m"));
 
-        String json = new DeadlockAnalyzerInputGenerator().generate(List.of(rt), 1);
+        String json = new DeadlockAnalyzerInputGenerator().generate(List.of(rt), 1, "deadlock-analyzer-input.json");
         JsonNode tx = MAPPER.readTree(json).get("transactions").get(0);
         JsonNode params = tx.get("statements").get(0).get("parameters");
         assertEquals(1, params.get("sym_userId").asInt());

@@ -24,11 +24,12 @@ public class Main {
 
     public static void main(String[] args) {
         if (args.length < 1) {
-            System.err.println("Usage: predlock-extractor <project-path>");
+            System.err.println("Usage: predlock-extractor <project-path> [output-path]");
             System.exit(1);
         }
 
         String projectPath = args[0];
+        String outputPath = args.length >= 2 ? args[1] : "deadlock-analyzer-input.json";
 
         if (!Files.exists(Path.of(projectPath))) {
             System.err.println("Error: project path does not exist: " + projectPath);
@@ -97,7 +98,7 @@ public class Main {
         // Phase 5: Generate deadlock analyzer input
         try {
             DeadlockAnalyzerInputGenerator generator = new DeadlockAnalyzerInputGenerator();
-            generator.generate(resolvedTransactions, 2);
+            generator.generate(resolvedTransactions, 2, outputPath);
             System.out.println("Phase 5 done: deadlock-analyzer-input.json written");
         } catch (Exception e) {
             System.err.println("Phase 5 failed: " + e.getMessage());

@@ -31,7 +31,7 @@ public class DeadlockAnalyzerInputGenerator {
      * @return the JSON string
      * @throws IOException if writing the JSON file fails
      */
-    public String generate(List<ResolvedTransaction> transactions, int concurrentCopies) throws IOException {
+    public String generate(List<ResolvedTransaction> transactions, int concurrentCopies, String outputPath) throws IOException {
         ObjectMapper mapper = new ObjectMapper();
         mapper.enable(SerializationFeature.INDENT_OUTPUT);
 
@@ -106,8 +106,12 @@ public class DeadlockAnalyzerInputGenerator {
         String json = mapper.writeValueAsString(root);
 
         // Write to file
-        mapper.writeValue(new File("deadlock-analyzer-input.json"), root);
-        log.info("Written deadlock-analyzer-input.json");
+        File outputFile = new File(outputPath);
+        if (outputFile.getParentFile() != null) {
+            outputFile.getParentFile().mkdirs();
+        }
+        mapper.writeValue(outputFile, root);
+        log.info("Written {}", outputPath);
 
         return json;
     }
