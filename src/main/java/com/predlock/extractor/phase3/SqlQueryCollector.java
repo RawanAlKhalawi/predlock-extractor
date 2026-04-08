@@ -5,6 +5,7 @@ import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.type.Type;
@@ -12,6 +13,7 @@ import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import com.predlock.extractor.model.EntityModel;
 import com.predlock.extractor.model.RelationshipInfo;
 import com.predlock.extractor.model.SqlOperation;
+import com.predlock.extractor.util.ParseUtils;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.delete.Delete;
@@ -36,14 +38,16 @@ import java.util.regex.Pattern;
 
 /**
  * Phase 3: Collects SQL queries from Spring Data repositories, {@code @Query} annotations,
- * JdbcTemplate calls, and EntityManager calls.
+ * JdbcTemplate calls, EntityManager calls, named queries, and EM lifecycle methods.
  * <p>
- * Handles four forms:
+ * Handles six forms:
  * <ul>
  *   <li>Form A — {@code @Query} with {@code nativeQuery=true}: parsed with JSQLParser</li>
  *   <li>Form B — {@code @Query} with JPQL: entity names mapped to tables via EntityModel</li>
  *   <li>Form C — Spring Data derived query method names: parsed via naming convention</li>
  *   <li>Form D — JdbcTemplate / EntityManager string arguments: parsed with JSQLParser</li>
+ *   <li>Form E — {@code @NamedQuery} / {@code @NamedNativeQuery} resolved via {@code createNamedQuery}</li>
+ *   <li>Form F — EM lifecycle methods: {@code persist}, {@code merge}, {@code remove}, {@code find}</li>
  * </ul>
  */
 public class SqlQueryCollector {
@@ -68,22 +72,47 @@ public class SqlQueryCollector {
         "createQuery", "createNativeQuery"
     );
 
+    /**
+     * Form F — EM lifecycle methods mapped to their effective SQL operation type.
+     * {@code merge} is conservatively treated as UPDATE (JPA upsert semantics).
+     */
+    private static final Map<String, String> EM_LIFECYCLE_METHODS = Map.of(
+        "persist", "INSERT",
+        "merge",   "UPDATE",
+        "remove",  "DELETE",
+        "find",    "SELECT"
+    );
+
+    private static final Set<String> JAVA_TYPES = Set.of(
+        "String", "Integer", "Long", "Double", "Float", "Boolean",
+        "Object", "List", "Set", "Map", "Collection", "Optional",
+        "Void", "Class", "Enum", "Number"
+    );
+
+    /**
+     * Suffixes stripped from type/variable names when resolving to entity names.
+     * Tried in order — first match wins.
+     */
+    private static final List<String> ENTITY_TYPE_SUFFIXES = List.of(
+        "Impl", "Dao", "Entity", "Repository"
+    );
+
     private static final Pattern CAMEL_SPLIT = Pattern.compile("(?<=[a-z])(?=[A-Z])");
 
     // -------------------------------------------------------------------------
-    // FIX 1: Use a single shared DynClassLoader so that nested entity classes
-    // defined for relationship fields are resolvable when PartTree reflects on
-    // the parent entity class.  The original code created a new loader per
-    // class, so any reference from parent → nested class crossed loader
-    // boundaries and caused NoClassDefFoundError / property-not-found errors.
+    // Named query registry
     // -------------------------------------------------------------------------
 
     /**
-     * Custom ClassLoader for defining dynamic entity classes at runtime.
-     * A single shared instance is used so that nested classes (e.g. the
-     * dynamic "Product" class referenced by "OrderItem.product") are visible
-     * to the parent class's loader during PartTree reflection.
+     * Holds the SQL (or JPQL) string and whether it is a native query,
+     * keyed by the named query's logical name.
      */
+    private record NamedQueryEntry(String sql, boolean isNative) {}
+
+    // -------------------------------------------------------------------------
+    // Dynamic ClassLoader for PartTree reflection
+    // -------------------------------------------------------------------------
+
     private static class DynClassLoader extends ClassLoader {
         DynClassLoader(ClassLoader parent) { super(parent); }
         Class<?> define(String name, byte[] bytes) {
@@ -98,29 +127,14 @@ public class SqlQueryCollector {
     private static int dynClassCounter = 0;
 
     // -------------------------------------------------------------------------
-    // FIX 2: buildDynamicEntityClass now accepts a Map<String, Class<?>> for
-    // relationship fields that must carry a specific return type so that
-    // PartTree can traverse nested property paths (e.g. product_Id →
-    // getProduct().getId()).  Simple scalar fields continue to use Object.
+    // Dynamic entity class builder
     // -------------------------------------------------------------------------
 
-    /**
-     * Builds a dynamic class with getter/setter properties for the given fields,
-     * suitable for use with Spring Data's {@link PartTree}.
-     *
-     * @param entityName   simple entity name, used only for the generated class name
-     * @param simpleFields fields whose getter/setter type is {@code Object}
-     * @param typedFields  relationship fields mapped to their target dynamic class;
-     *                     getters will declare the exact return type so PartTree can
-     *                     traverse nested paths (e.g. {@code product_Id})
-     */
     private static Class<?> buildDynamicEntityClass(String entityName,
                                                     List<String> simpleFields,
                                                     Map<String, Class<?>> typedFields) {
-        String className = "com.predlock.dyn." + entityName + "_" + (dynClassCounter++);
+        String className    = "com.predlock.dyn." + entityName + "_" + (dynClassCounter++);
         String internalName = className.replace('.', '/');
-        // COMPUTE_FRAMES required: without it the JVM 17 verifier rejects the setter bytecode
-        // when the field descriptor is a concrete type but the parameter is declared as Object.
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
         cw.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, internalName, null, "java/lang/Object", null);
 
@@ -133,12 +147,10 @@ public class SqlQueryCollector {
         mv.visitMaxs(0, 0);
         mv.visitEnd();
 
-        // Simple (scalar) fields — getter returns Object
         for (String field : simpleFields) {
             emitFieldWithAccessors(cw, internalName, field, "Ljava/lang/Object;", "()Ljava/lang/Object;");
         }
 
-        // Typed (relationship) fields — getter returns the concrete nested class
         for (Map.Entry<String, Class<?>> entry : typedFields.entrySet()) {
             String field      = entry.getKey();
             Class<?> type     = entry.getValue();
@@ -150,22 +162,14 @@ public class SqlQueryCollector {
         return SHARED_LOADER.define(className, cw.toByteArray());
     }
 
-    /**
-     * Emits a private field plus a public getter and setter into {@code cw}.
-     *
-     * @param fieldDescriptor  JVM type descriptor for the field storage type (e.g. {@code Ljava/lang/Object;})
-     * @param getterDescriptor JVM method descriptor for the getter (e.g. {@code ()Ljava/lang/Object;})
-     */
     private static void emitFieldWithAccessors(ClassWriter cw, String ownerInternal,
                                                String fieldName,
                                                String fieldDescriptor,
                                                String getterDescriptor) {
-        // Field
         cw.visitField(Opcodes.ACC_PRIVATE, fieldName, fieldDescriptor, null, null).visitEnd();
 
         String cap = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
 
-        // Getter
         MethodVisitor gmv = cw.visitMethod(Opcodes.ACC_PUBLIC, "get" + cap, getterDescriptor, null, null);
         gmv.visitCode();
         gmv.visitVarInsn(Opcodes.ALOAD, 0);
@@ -174,13 +178,10 @@ public class SqlQueryCollector {
         gmv.visitMaxs(0, 0);
         gmv.visitEnd();
 
-        // Setter — parameter is Object; CHECKCAST to the field's concrete type before PUTFIELD
-        // so the JVM 17 verifier accepts the store even when fieldDescriptor is not Object.
         MethodVisitor smv = cw.visitMethod(Opcodes.ACC_PUBLIC, "set" + cap, "(Ljava/lang/Object;)V", null, null);
         smv.visitCode();
         smv.visitVarInsn(Opcodes.ALOAD, 0);
         smv.visitVarInsn(Opcodes.ALOAD, 1);
-        // Strip leading 'L' and trailing ';' to get the internal name for CHECKCAST
         if (!fieldDescriptor.equals("Ljava/lang/Object;")) {
             String castTarget = fieldDescriptor.substring(1, fieldDescriptor.length() - 1);
             smv.visitTypeInsn(Opcodes.CHECKCAST, castTarget);
@@ -191,9 +192,84 @@ public class SqlQueryCollector {
         smv.visitEnd();
     }
 
+    // -------------------------------------------------------------------------
+    // Named query pre-scan (static helpers — no SqlVisitor instance needed)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Scans a class for {@code @NamedQuery}, {@code @NamedNativeQuery},
+     * {@code @NamedQueries}, and {@code @NamedNativeQueries} and registers
+     * every entry into {@code map}.
+     */
+    private static void extractNamedQueries(ClassOrInterfaceDeclaration cls,
+                                            Map<String, NamedQueryEntry> map) {
+        for (AnnotationExpr ann : cls.getAnnotations()) {
+            String annName = ann.getNameAsString();
+            switch (annName) {
+                case "NamedQuery"         -> parseAndRegisterNamedQuery(ann, false, map);
+                case "NamedNativeQuery"   -> parseAndRegisterNamedQuery(ann, true,  map);
+                case "NamedQueries",
+                     "NamedNativeQueries" -> {
+                    if (ann instanceof SingleMemberAnnotationExpr single) {
+                        collectNestedAnnotations(single.getMemberValue(), map);
+                    } else if (ann instanceof NormalAnnotationExpr normal) {
+                        for (MemberValuePair mvp : normal.getPairs()) {
+                            if (mvp.getNameAsString().equals("value")) {
+                                collectNestedAnnotations(mvp.getValue(), map);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static void collectNestedAnnotations(Expression expr,
+                                                 Map<String, NamedQueryEntry> map) {
+        if (expr instanceof ArrayInitializerExpr arr) {
+            for (Expression e : arr.getValues()) {
+                if (e instanceof AnnotationExpr ann) {
+                    boolean isNative = ann.getNameAsString().equals("NamedNativeQuery");
+                    parseAndRegisterNamedQuery(ann, isNative, map);
+                }
+            }
+        } else if (expr instanceof AnnotationExpr ann) {
+            boolean isNative = ann.getNameAsString().equals("NamedNativeQuery");
+            parseAndRegisterNamedQuery(ann, isNative, map);
+        }
+    }
+
+    private static void parseAndRegisterNamedQuery(AnnotationExpr ann, boolean isNative,
+                                                   Map<String, NamedQueryEntry> map) {
+        String name = null, query = null;
+        if (ann instanceof NormalAnnotationExpr normal) {
+            for (MemberValuePair mvp : normal.getPairs()) {
+                if (mvp.getNameAsString().equals("name"))
+                    name  = extractStringLiteralStatic(mvp.getValue());
+                else if (mvp.getNameAsString().equals("query"))
+                    query = extractStringLiteralStatic(mvp.getValue());
+            }
+        }
+        if (name != null && query != null) {
+            map.put(name, new NamedQueryEntry(query, isNative));
+            log.debug("Registered named query '{}': {}", name, query);
+        }
+    }
+
+    /** Static string-literal extractor (usable outside {@link SqlVisitor}). */
+    private static String extractStringLiteralStatic(Expression expr) {
+        if (expr instanceof StringLiteralExpr sle) return sle.getValue();
+        String s = expr.toString();
+        return (s.startsWith("\"") && s.endsWith("\"")) ? s.substring(1, s.length() - 1) : null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Public entry point
+    // -------------------------------------------------------------------------
+
     /**
      * Scans the given project path for repository interfaces and service classes,
-     * extracting SQL operations from all four forms.
+     * extracting SQL operations from all forms.
      *
      * @param projectPath the root path of the Spring Boot project to analyze
      * @param entityModel the entity model from Phase 1, used for table/column resolution
@@ -201,53 +277,39 @@ public class SqlQueryCollector {
      */
     public Map<String, List<SqlOperation>> collect(String projectPath, EntityModel entityModel) {
         Map<String, List<SqlOperation>> result = new LinkedHashMap<>();
+        List<CompilationUnit> cus = ParseUtils.parseFromDir(projectPath);
 
-        List<CompilationUnit> cus = parseFromDir(projectPath);
+        // Pre-scan: build named query map from @NamedQuery / @NamedNativeQuery on entity classes
+        Map<String, NamedQueryEntry> namedQueryMap = new LinkedHashMap<>();
         for (CompilationUnit cu : cus) {
-            cu.accept(new SqlVisitor(entityModel, result), null);
+            cu.findAll(ClassOrInterfaceDeclaration.class)
+                .forEach(cls -> extractNamedQueries(cls, namedQueryMap));
+        }
+        log.debug("Named query registry: {} entries", namedQueryMap.size());
+
+        for (CompilationUnit cu : cus) {
+            cu.accept(new SqlVisitor(entityModel, result, namedQueryMap), null);
         }
 
         return result;
     }
 
-    /**
-     * Recursively parse all .java files under a directory.
-     */
-    private List<CompilationUnit> parseFromDir(String dirPath) {
-        List<CompilationUnit> results = new ArrayList<>();
-        parseFromDir(dirPath, results);
-        return results;
-    }
+    // -------------------------------------------------------------------------
+    // Visitor
+    // -------------------------------------------------------------------------
 
-    private void parseFromDir(String dirPath, List<CompilationUnit> results) {
-        File[] files = new File(dirPath).listFiles();
-        if (files == null) return;
-        for (File file : files) {
-            if (file.isDirectory()) {
-                parseFromDir(file.getAbsolutePath(), results);
-            } else if (file.getName().toLowerCase().endsWith(".java")) {
-                try {
-                    results.add(StaticJavaParser.parse(file));
-                } catch (ParseProblemException e) {
-                    log.warn("Parse error in {}: {}", file.getPath(), e.getMessage());
-                } catch (Exception e) {
-                    log.warn("Error reading {}: {}", file.getPath(), e.getMessage());
-                }
-            }
-        }
-    }
-
-    /**
-     * Visitor that processes both repository interfaces and service/component classes.
-     */
     private static class SqlVisitor extends VoidVisitorAdapter<Void> {
 
         private final EntityModel entityModel;
         private final Map<String, List<SqlOperation>> result;
+        private final Map<String, NamedQueryEntry> namedQueryMap;
 
-        SqlVisitor(EntityModel entityModel, Map<String, List<SqlOperation>> result) {
-            this.entityModel = entityModel;
-            this.result = result;
+        SqlVisitor(EntityModel entityModel,
+                   Map<String, List<SqlOperation>> result,
+                   Map<String, NamedQueryEntry> namedQueryMap) {
+            this.entityModel   = entityModel;
+            this.result        = result;
+            this.namedQueryMap = namedQueryMap;
         }
 
         @Override
@@ -255,8 +317,7 @@ public class SqlQueryCollector {
             super.visit(cls, arg);
 
             String className = cls.getNameAsString();
-
-            boolean isRepo = isRepository(cls);
+            boolean isRepo   = isRepository(cls);
 
             String repoEntityName = null;
             String repoTableName  = null;
@@ -269,7 +330,7 @@ public class SqlQueryCollector {
             }
 
             for (MethodDeclaration method : cls.getMethods()) {
-                String methodName  = method.getNameAsString();
+                String methodName   = method.getNameAsString();
                 String sourceMethod = className + "." + methodName;
 
                 // Form A & B: @Query annotation
@@ -286,10 +347,48 @@ public class SqlQueryCollector {
                     }
                 }
 
-                // Form D: JdbcTemplate / EntityManager calls inside method body
+                // Form D / E / F: method body calls
                 if (method.getBody().isPresent()) {
                     method.getBody().get().findAll(MethodCallExpr.class).forEach(call -> {
                         String callName = call.getNameAsString();
+
+                        // Form E — createNamedQuery("BC_READ_...")
+                        if (callName.equals("createNamedQuery") && !call.getArguments().isEmpty()) {
+                            String queryName = extractStringLiteral(call.getArgument(0));
+                            if (queryName != null) {
+                                NamedQueryEntry entry = namedQueryMap.get(queryName);
+                                if (entry != null) {
+                                    if (entry.isNative()) handleNativeSql(entry.sql(), sourceMethod);
+                                    else                  handleJpql(entry.sql(), sourceMethod);
+                                } else {
+                                    log.debug("Named query '{}' not found in registry for {}",
+                                        queryName, sourceMethod);
+                                }
+                            }
+                            return;
+                        }
+
+                        // Form F — EM lifecycle: persist / merge / remove / find
+                        if (EM_LIFECYCLE_METHODS.containsKey(callName) && !call.getArguments().isEmpty()) {
+                            String sqlType  = EM_LIFECYCLE_METHODS.get(callName);
+                            Expression arg0 = call.getArgument(0);
+                            // Pass method and cls so declared types can be resolved accurately
+                            String entityHint = guessEntityName(arg0, method, cls);
+                            String table = entityHint != null
+                                ? entityModel.getEntityToTable()
+                                .getOrDefault(entityHint, camelToSnake(entityHint))
+                                : "unknown";
+
+                            String pseudoSql = sqlType + " INTO/FROM " + table
+                                + " (via em." + callName + ")";
+                            addOperation(sourceMethod, new SqlOperation(
+                                sqlType, pseudoSql,
+                                table.equals("unknown") ? List.of() : List.of(table),
+                                null, sourceMethod));
+                            return;
+                        }
+
+                        // Form D — JdbcTemplate / createQuery / createNativeQuery with inline SQL
                         if ((JDBC_METHODS.contains(callName) || EM_METHODS.contains(callName))
                             && !call.getArguments().isEmpty()) {
                             Expression firstArg = call.getArgument(0);
@@ -306,6 +405,10 @@ public class SqlQueryCollector {
                 }
             }
         }
+
+        // -----------------------------------------------------------------
+        // Repository detection helpers
+        // -----------------------------------------------------------------
 
         private boolean isRepository(ClassOrInterfaceDeclaration cls) {
             for (AnnotationExpr a : cls.getAnnotations()) {
@@ -332,7 +435,12 @@ public class SqlQueryCollector {
             return null;
         }
 
-        private void handleQueryAnnotation(AnnotationExpr annotation, String sourceMethod, String repoEntityName) {
+        // -----------------------------------------------------------------
+        // Form A & B
+        // -----------------------------------------------------------------
+
+        private void handleQueryAnnotation(AnnotationExpr annotation, String sourceMethod,
+                                           String repoEntityName) {
             String queryValue = null;
             boolean isNative  = false;
 
@@ -357,12 +465,16 @@ public class SqlQueryCollector {
             }
         }
 
+        // -----------------------------------------------------------------
+        // SQL / JPQL handlers
+        // -----------------------------------------------------------------
+
         private void handleNativeSql(String sql, String sourceMethod) {
             try {
-                Statement stmt   = CCJSqlParserUtil.parse(sql);
-                String type      = getSqlType(stmt);
+                Statement stmt      = CCJSqlParserUtil.parse(sql);
+                String type         = getSqlType(stmt);
                 List<String> tables = new TablesNamesFinder().getTableList(stmt);
-                String where     = extractWhere(stmt);
+                String where        = extractWhere(stmt);
                 addOperation(sourceMethod, new SqlOperation(type, sql, tables, where, sourceMethod));
             } catch (Exception e) {
                 log.warn("JSQLParser failed for '{}' in {}: {}", sql, sourceMethod, e.getMessage());
@@ -383,11 +495,16 @@ public class SqlQueryCollector {
                 if (!tables.contains(table)) tables.add(table);
             }
             String where = null;
-            Pattern wherePattern = Pattern.compile("(?i)WHERE\\s+(.+?)(?:\\s+ORDER\\s+BY|\\s+GROUP\\s+BY|$)");
+            Pattern wherePattern = Pattern.compile(
+                "(?i)WHERE\\s+(.+?)(?:\\s+ORDER\\s+BY|\\s+GROUP\\s+BY|$)");
             Matcher wm = wherePattern.matcher(jpql);
             if (wm.find()) where = wm.group(1).trim();
             addOperation(sourceMethod, new SqlOperation(type, jpql, tables, where, sourceMethod));
         }
+
+        // -----------------------------------------------------------------
+        // Form C — derived query methods
+        // -----------------------------------------------------------------
 
         private boolean handleDerivedQuery(String methodName, String sourceMethod,
                                            String tableName, String entityName) {
@@ -396,14 +513,12 @@ public class SqlQueryCollector {
 
             String prefix = entityName + ".";
 
-            // Scalar fields from field-to-column map
             for (String key : entityModel.getFieldToColumn().keySet()) {
                 if (key.startsWith(prefix)) {
                     simpleFields.add(key.substring(prefix.length()));
                 }
             }
 
-            // Relationship fields — build a nested dynamic class per target entity
             for (Map.Entry<String, RelationshipInfo> entry : entityModel.getRelationships().entrySet()) {
                 String key = entry.getKey();
                 if (!key.startsWith(prefix)) continue;
@@ -412,7 +527,6 @@ public class SqlQueryCollector {
                 String targetEntity = entry.getValue().getTargetEntity();
 
                 if (targetEntity == null) {
-                    // Can't determine target entity — treat as a plain Object field
                     simpleFields.add(relFieldName);
                     continue;
                 }
@@ -429,7 +543,6 @@ public class SqlQueryCollector {
                 }
             }
 
-            // Ensure common fields are present on the entity class itself
             for (String common : List.of("id", "name", "status", "createdAt", "updatedAt")) {
                 if (!simpleFields.contains(common) && !typedFields.containsKey(common)) {
                     simpleFields.add(common);
@@ -449,13 +562,9 @@ public class SqlQueryCollector {
                     type = "SELECT";
                 }
 
-                // alias map: table name → short alias (e.g. "order_item" → "oi", "product" → "p")
-                // Built lazily as tables are encountered; owner table is always first.
                 Map<String, String> tableAliases = new LinkedHashMap<>();
                 tableAliases.put(tableName, tableAlias(tableName));
 
-                // Per-Part result: (aliasedColumn, joinedTable, RelationshipInfo)
-                // joinedTable/rel are null for simple (non-nested) fields.
                 record PartInfo(String aliasedColumn, String joinedTable, RelationshipInfo rel) {}
                 List<PartInfo> partInfos = new ArrayList<>();
 
@@ -492,32 +601,28 @@ public class SqlQueryCollector {
 
                 String partSeparator = methodName.matches(".*(?:Or)[A-Z].*") ? " OR " : " AND ";
 
-                // Build the FROM + JOIN clause
                 String ownerAlias = tableAliases.get(tableName);
                 StringBuilder fromClause = new StringBuilder(tableName).append(" ").append(ownerAlias);
 
-                // Collect unique joins (one JOIN per distinct joined table)
                 Set<String> joinedAlready = new LinkedHashSet<>();
                 for (PartInfo pi : partInfos) {
                     if (pi.joinedTable() == null || joinedAlready.contains(pi.joinedTable())) continue;
                     joinedAlready.add(pi.joinedTable());
 
-                    String joinAlias    = tableAliases.get(pi.joinedTable());
-                    String joinColumn   = pi.rel().getJoinColumn(); // e.g. "product_id"
-                    // ON clause: joinedTable.id = ownerTable.joinColumn
+                    String joinAlias  = tableAliases.get(pi.joinedTable());
+                    String joinColumn = pi.rel().getJoinColumn();
                     fromClause.append(" JOIN ").append(pi.joinedTable()).append(" ").append(joinAlias)
                         .append(" ON ").append(joinAlias).append(".id")
                         .append(" = ").append(ownerAlias).append(".").append(joinColumn);
                 }
 
-                // If no JOINs, strip aliases from WHERE columns — use plain column name only
                 String whereCondition;
                 if (joinedAlready.isEmpty()) {
                     whereCondition = partInfos.isEmpty() ? null :
                         partInfos.stream()
                             .map(pi -> pi.aliasedColumn().contains(".")
-                                    ? pi.aliasedColumn().substring(pi.aliasedColumn().indexOf('.') + 1)
-                                    : pi.aliasedColumn())
+                                ? pi.aliasedColumn().substring(pi.aliasedColumn().indexOf('.') + 1)
+                                : pi.aliasedColumn())
                             .map(col -> col + " = ?")
                             .collect(Collectors.joining(partSeparator));
                 } else {
@@ -527,7 +632,6 @@ public class SqlQueryCollector {
                             .collect(Collectors.joining(partSeparator));
                 }
 
-                // Select list: owner alias.* plus each joined alias.*
                 StringBuilder selectList = new StringBuilder(ownerAlias).append(".*");
                 for (String jt : joinedAlready) {
                     selectList.append(", ").append(tableAliases.get(jt)).append(".*");
@@ -537,7 +641,8 @@ public class SqlQueryCollector {
 
                 String rawSql;
                 if (type.equals("DELETE")) {
-                    rawSql = "DELETE FROM " + tableName + (whereCondition != null ? " WHERE " + whereCondition : "");
+                    rawSql = "DELETE FROM " + tableName
+                        + (whereCondition != null ? " WHERE " + whereCondition : "");
                 } else if (type.equals("SELECT COUNT")) {
                     if (joinedAlready.isEmpty()) {
                         rawSql = "SELECT COUNT(*) FROM " + tableName
@@ -556,20 +661,16 @@ public class SqlQueryCollector {
                     }
                 }
 
-                addOperation(sourceMethod, new SqlOperation(type, rawSql, involvedTables, whereCondition, sourceMethod));
+                addOperation(sourceMethod,
+                    new SqlOperation(type, rawSql, involvedTables, whereCondition, sourceMethod));
                 return true;
             } catch (Exception e) {
-                log.debug("PartTree did not recognize '{}' in {}: {}", methodName, sourceMethod, e.getMessage());
+                log.debug("PartTree did not recognize '{}' in {}: {}",
+                    methodName, sourceMethod, e.getMessage());
                 return false;
             }
         }
 
-        /**
-         * Builds a lightweight dynamic class for a target relationship entity.
-         * The class exposes the target entity's scalar fields (from EntityModel)
-         * plus the common fallback fields so that PartTree can resolve nested
-         * property paths such as {@code product_Id} or {@code product_Name}.
-         */
         private Class<?> buildNestedEntityClass(String targetEntity) {
             List<String> targetFields = new ArrayList<>();
             String prefix = targetEntity + ".";
@@ -581,19 +682,127 @@ public class SqlQueryCollector {
             for (String common : List.of("id", "name", "status", "createdAt", "updatedAt")) {
                 if (!targetFields.contains(common)) targetFields.add(common);
             }
-            // Nested classes have no further typed relationships — pass empty map
             return buildDynamicEntityClass(targetEntity, targetFields, Collections.emptyMap());
         }
 
-        private String buildWhereCondition(List<String> columns) {
-            if (columns.isEmpty()) return null;
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < columns.size(); i++) {
-                if (i > 0) sb.append(" AND ");
-                sb.append(columns.get(i)).append(" = ?");
+        // -----------------------------------------------------------------
+        // Form F helper — resolve entity name from EM lifecycle call argument
+        // -----------------------------------------------------------------
+
+        /**
+         * Resolves the entity name from an EM lifecycle call argument.
+         * <p>Priority order:
+         * <ol>
+         *   <li>Class literal — {@code em.find(CountryImpl.class, id)}</li>
+         *   <li>Local variable type declared in the method body</li>
+         *   <li>Field type declared in the enclosing class</li>
+         *   <li>Fallback: capitalise the variable name and apply suffix stripping</li>
+         * </ol>
+         * Each candidate type name is passed through {@link #resolveEntityFromTypeName}
+         * which handles {@code Impl}/{@code Dao}/{@code Entity} suffixes common in
+         * frameworks like Broadleaf Commerce.
+         */
+        private String guessEntityName(Expression arg,
+                                       MethodDeclaration method,
+                                       ClassOrInterfaceDeclaration cls) {
+            // 1. Class literal: em.find(CountryImpl.class, id)
+            if (arg instanceof ClassExpr ce) {
+                return resolveEntityFromTypeName(ce.getType().asString());
             }
-            return sb.toString();
+
+            if (!(arg instanceof NameExpr ne)) return null;
+            String varName = ne.getNameAsString();
+
+            // 2. Method parameters — Parameter nodes are NOT VariableDeclarators
+            String paramType = method.getParameters().stream()
+                .filter(p -> p.getNameAsString().equals(varName))
+                .map(p -> p.getType().asString())
+                .findFirst().orElse(null);
+            if (paramType != null) {
+                String resolved = resolveEntityFromTypeName(paramType);
+                if (resolved != null) return resolved;
+            }
+
+            // 3. Local variable declarations in the method body
+            String localType = method.findAll(VariableDeclarator.class).stream()
+                .filter(vd -> vd.getNameAsString().equals(varName))
+                .map(vd -> vd.getType().asString())
+                .findFirst().orElse(null);
+            if (localType != null) {
+                String resolved = resolveEntityFromTypeName(localType);
+                if (resolved != null) return resolved;
+            }
+
+            // 4. Enclosing class field declarations
+            String fieldType = cls.getFields().stream()
+                .flatMap(fd -> fd.getVariables().stream())
+                .filter(vd -> vd.getNameAsString().equals(varName))
+                .map(vd -> vd.getType().asString())
+                .findFirst().orElse(null);
+            if (fieldType != null) {
+                String resolved = resolveEntityFromTypeName(fieldType);
+                if (resolved != null) return resolved;
+            }
+
+            // 5. Fallback: capitalise variable name and attempt resolution
+            String capitalized = Character.toUpperCase(varName.charAt(0)) + varName.substring(1);
+            return resolveEntityFromTypeName(capitalized);
         }
+
+        /**
+         * Resolves a raw Java type name to the best matching entity name in the entity model.
+         * <p>Resolution steps:
+         * <ol>
+         *   <li>Direct match — e.g. {@code "OrderImpl"} already in entity model</li>
+         *   <li>Strip known suffix ({@code Impl}, {@code Dao}, {@code Entity}, {@code Repository})
+         *       to get a base name — e.g. {@code "CountryDao"} → {@code "Country"}</li>
+         *   <li>Try the stripped base directly — e.g. {@code "Country"} interface is the entity key</li>
+         *   <li>Try {@code base + "Impl"} — the most common JPA pattern:
+         *       {@code "CountryDao"} → {@code "Country"} → {@code "CountryImpl"} → {@code BLC_COUNTRY}</li>
+         *   <li>Return {@code base} as a best-effort fallback so {@code camelToSnake} at least
+         *       produces {@code "country"} rather than {@code "country_dao"}</li>
+         * </ol>
+         * Returns {@code null} if no suffix was stripped and the type is not in the entity model,
+         * allowing the caller to fall through to camelToSnake on the original variable name.
+         */
+        private String resolveEntityFromTypeName(String typeName) {
+            if (typeName == null || typeName.isBlank()) return null;
+            if (JAVA_TYPES.contains(typeName)) return null;
+
+            // 1. Direct match
+            if (entityModel.getEntityToTable().containsKey(typeName)) return typeName;
+
+            // 2. Try typeName + "Impl" — the most common Broadleaf pattern:
+            //    interface "OrderMultishipOption" → "OrderMultishipOptionImpl" → BLC_ORDER_MULTISHIP_OPTION
+            //    This must run BEFORE suffix stripping so "OrderItem" → "OrderItemImpl" wins
+            //    over "OrderItem" → strip nothing → dead end.
+            if (entityModel.getEntityToTable().containsKey(typeName + "Impl")) return typeName + "Impl";
+
+            // 3. Strip known suffix to get base name
+            String base = typeName;
+            for (String suffix : ENTITY_TYPE_SUFFIXES) {
+                if (typeName.endsWith(suffix) && typeName.length() > suffix.length()) {
+                    base = typeName.substring(0, typeName.length() - suffix.length());
+                    break;
+                }
+            }
+
+            // No suffix was stripped — nothing more we can do
+            if (base.equals(typeName)) return null;
+
+            // 4. Try base directly (e.g. "Country" interface is the entity key)
+            if (entityModel.getEntityToTable().containsKey(base)) return base;
+
+            // 5. Try base + "Impl"
+            if (entityModel.getEntityToTable().containsKey(base + "Impl")) return base + "Impl";
+
+            // 6. Return base as fallback — better than the suffixed original for camelToSnake
+            return base;
+        }
+
+        // -----------------------------------------------------------------
+        // Utility
+        // -----------------------------------------------------------------
 
         private static String camelToSnake(String camel) {
             StringBuilder sb = new StringBuilder();
@@ -609,11 +818,6 @@ public class SqlQueryCollector {
             return sb.toString();
         }
 
-        /**
-         * Derives a short SQL alias from a table name.
-         * Joins the first letter of each underscore-separated word.
-         * E.g. "order_item" → "oi", "product" → "p", "user_transaction" → "ut"
-         */
         private static String tableAlias(String tableName) {
             StringBuilder sb = new StringBuilder();
             boolean nextChar = true;
@@ -629,21 +833,16 @@ public class SqlQueryCollector {
         }
 
         private static String extractStringLiteral(Expression expr) {
-            if (expr instanceof StringLiteralExpr sle) {
-                return sle.getValue();
-            }
+            if (expr instanceof StringLiteralExpr sle) return sle.getValue();
             String s = expr.toString();
-            if (s.startsWith("\"") && s.endsWith("\"")) {
-                return s.substring(1, s.length() - 1);
-            }
-            return null;
+            return (s.startsWith("\"") && s.endsWith("\"")) ? s.substring(1, s.length() - 1) : null;
         }
 
         private String getSqlType(Statement stmt) {
-            if (stmt instanceof Select)  return "SELECT";
-            if (stmt instanceof Insert)  return "INSERT";
-            if (stmt instanceof Update)  return "UPDATE";
-            if (stmt instanceof Delete)  return "DELETE";
+            if (stmt instanceof Select) return "SELECT";
+            if (stmt instanceof Insert) return "INSERT";
+            if (stmt instanceof Update) return "UPDATE";
+            if (stmt instanceof Delete) return "DELETE";
             return "UNKNOWN";
         }
 

@@ -15,6 +15,7 @@ import com.github.javaparser.ast.type.Type;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import com.predlock.extractor.model.EntityModel;
 import com.predlock.extractor.model.RelationshipInfo;
+import com.predlock.extractor.util.ParseUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,6 +37,11 @@ public class EntityModelExtractor {
     // Annotation constants (adapted from HBSniff Const.java)
     private static final String ENTITY_ANNOT = "Entity";
     private static final String TABLE_ANNOT = "Table";
+    private static final Set<String> TABLE_ANNOT_QUALIFIED = Set.of(
+        "Table",
+        "javax.persistence.Table",
+        "jakarta.persistence.Table"
+    );
     private static final String COLUMN_ANNOT = "Column";
     private static final String JOIN_COLUMN_ANNOT = "JoinColumn";
     private static final String ONE_TO_MANY_ANNOT = "OneToMany";
@@ -62,7 +68,7 @@ public class EntityModelExtractor {
         EntityModel model = new EntityModel();
 
         // Parse all .java files (adapted from HBSniff EntityParser.parseFromDir)
-        List<CompilationUnit> cus = parseFromDir(projectPath);
+        List<CompilationUnit> cus = ParseUtils.parseFromDir(projectPath);
 
         // Filter to @Entity classes (adapted from HBSniff EntityParser.getEntities)
         // and visit each one
@@ -71,37 +77,6 @@ public class EntityModelExtractor {
         }
 
         return model;
-    }
-
-    /**
-     * Recursively parse all .java files under a directory.
-     * Adapted from HBSniff EntityParser.parseFromDir.
-     */
-    private List<CompilationUnit> parseFromDir(String dirPath) {
-        List<CompilationUnit> results = new ArrayList<>();
-        parseFromDir(dirPath, results);
-        return results;
-    }
-
-    private void parseFromDir(String dirPath, List<CompilationUnit> results) {
-        File[] files = new File(dirPath).listFiles();
-        if (files == null) {
-            return;
-        }
-        for (File file : files) {
-            if (file.isDirectory()) {
-                parseFromDir(file.getAbsolutePath(), results);
-            } else if (file.getName().toLowerCase().endsWith(".java")) {
-                try {
-                    CompilationUnit cu = StaticJavaParser.parse(file);
-                    results.add(cu);
-                } catch (ParseProblemException e) {
-                    log.warn("Parse error in {}: {}", file.getPath(), e.getMessage());
-                } catch (Exception e) {
-                    log.warn("Error reading {}: {}", file.getPath(), e.getMessage());
-                }
-            }
-        }
     }
 
     /**
@@ -138,13 +113,17 @@ public class EntityModelExtractor {
             // Extract @Table(name=...) or default to lowercase class name
             String tableName = className.toLowerCase();
             for (AnnotationExpr annotation : cls.getAnnotations()) {
-                if (annotation.getNameAsString().equals(TABLE_ANNOT)) {
-                    String name = getAnnotationAttribute(annotation, NAME_ATTR);
-                    if (name != null) {
-                        tableName = name;
-                    }
-                    break;
+                String annotSimpleName = annotation.getNameAsString();
+                // Handle both "Table" and "javax.persistence.Table"
+                // but NOT "org.hibernate.annotations.Table" (which uses appliesTo, not name)
+                if (!TABLE_ANNOT_QUALIFIED.contains(annotSimpleName)) continue;
+
+                String name = getAnnotationAttribute(annotation, NAME_ATTR);
+                if (name != null && !name.isBlank()) {
+                    tableName = name;
+                    break;   // found the JPA @Table with a real name — done
                 }
+                // name was null (e.g. Hibernate @Table with only appliesTo) — keep scanning
             }
             model.getEntityToTable().put(className, tableName);
 

@@ -11,6 +11,7 @@ import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import com.predlock.extractor.model.TransactionTemplate;
+import com.predlock.extractor.util.ParseUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,44 +50,13 @@ public class TransactionBoundaryExtractor {
     public List<TransactionTemplate> extract(String projectPath) {
         List<TransactionTemplate> results = new ArrayList<>();
 
-        List<CompilationUnit> cus = parseFromDir(projectPath);
+        List<CompilationUnit> cus = ParseUtils.parseFromDir(projectPath);
 
         for (CompilationUnit cu : cus) {
             cu.accept(new TransactionalVisitor(results), null);
         }
 
         return results;
-    }
-
-    /**
-     * Recursively parse all .java files under a directory.
-     * Same pattern as Phase 1 EntityModelExtractor.
-     */
-    private List<CompilationUnit> parseFromDir(String dirPath) {
-        List<CompilationUnit> results = new ArrayList<>();
-        parseFromDir(dirPath, results);
-        return results;
-    }
-
-    private void parseFromDir(String dirPath, List<CompilationUnit> results) {
-        File[] files = new File(dirPath).listFiles();
-        if (files == null) {
-            return;
-        }
-        for (File file : files) {
-            if (file.isDirectory()) {
-                parseFromDir(file.getAbsolutePath(), results);
-            } else if (file.getName().toLowerCase().endsWith(".java")) {
-                try {
-                    CompilationUnit cu = StaticJavaParser.parse(file);
-                    results.add(cu);
-                } catch (ParseProblemException e) {
-                    log.warn("Parse error in {}: {}", file.getPath(), e.getMessage());
-                } catch (Exception e) {
-                    log.warn("Error reading {}: {}", file.getPath(), e.getMessage());
-                }
-            }
-        }
     }
 
     /**
