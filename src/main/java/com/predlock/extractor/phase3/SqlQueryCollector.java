@@ -342,7 +342,8 @@ public class SqlQueryCollector {
 
                 // Form C: Spring Data derived query method names (only in repo interfaces)
                 if (isRepo && repoTableName != null) {
-                    if (handleDerivedQuery(methodName, sourceMethod, repoTableName, repoEntityName)) {
+                    int methodLine = method.getBegin().map(p -> p.line).orElse(0);
+                    if (handleDerivedQuery(methodName, sourceMethod, repoTableName, repoEntityName, methodLine)) {
                         continue;
                     }
                 }
@@ -358,11 +359,9 @@ public class SqlQueryCollector {
                             if (queryName != null) {
                                 NamedQueryEntry entry = namedQueryMap.get(queryName);
                                 if (entry != null) {
-                                    if (entry.isNative()) handleNativeSql(entry.sql(), sourceMethod);
-                                    else                  handleJpql(entry.sql(), sourceMethod);
-                                } else {
-                                    log.debug("Named query '{}' not found in registry for {}",
-                                        queryName, sourceMethod);
+                                    int line = call.getBegin().map(p -> p.line).orElse(0); // ← NEW
+                                    if (entry.isNative()) handleNativeSql(entry.sql(), sourceMethod, line);
+                                    else                  handleJpql(entry.sql(), sourceMethod, line);
                                 }
                             }
                             return;
@@ -372,19 +371,16 @@ public class SqlQueryCollector {
                         if (EM_LIFECYCLE_METHODS.containsKey(callName) && !call.getArguments().isEmpty()) {
                             String sqlType  = EM_LIFECYCLE_METHODS.get(callName);
                             Expression arg0 = call.getArgument(0);
-                            // Pass method and cls so declared types can be resolved accurately
                             String entityHint = guessEntityName(arg0, method, cls);
                             String table = entityHint != null
-                                ? entityModel.getEntityToTable()
-                                .getOrDefault(entityHint, camelToSnake(entityHint))
+                                ? entityModel.getEntityToTable().getOrDefault(entityHint, camelToSnake(entityHint))
                                 : "unknown";
-
-                            String pseudoSql = sqlType + " INTO/FROM " + table
-                                + " (via em." + callName + ")";
+                            String pseudoSql = sqlType + " INTO/FROM " + table + " (via em." + callName + ")";
+                            int line = call.getBegin().map(p -> p.line).orElse(0); // ← NEW
                             addOperation(sourceMethod, new SqlOperation(
                                 sqlType, pseudoSql,
                                 table.equals("unknown") ? List.of() : List.of(table),
-                                null, sourceMethod));
+                                null, sourceMethod, line)); // ← pass line
                             return;
                         }
 
@@ -394,11 +390,9 @@ public class SqlQueryCollector {
                             Expression firstArg = call.getArgument(0);
                             String sql = extractStringLiteral(firstArg);
                             if (sql != null && !sql.isBlank()) {
-                                if (callName.equals("createQuery")) {
-                                    handleJpql(sql, sourceMethod);
-                                } else {
-                                    handleNativeSql(sql, sourceMethod);
-                                }
+                                int line = call.getBegin().map(p -> p.line).orElse(0); // ← NEW
+                                if (callName.equals("createQuery")) handleJpql(sql, sourceMethod, line);
+                                else                                handleNativeSql(sql, sourceMethod, line);
                             }
                         }
                     });
@@ -469,21 +463,24 @@ public class SqlQueryCollector {
         // SQL / JPQL handlers
         // -----------------------------------------------------------------
 
-        private void handleNativeSql(String sql, String sourceMethod) {
+        private void handleNativeSql(String sql, String sourceMethod, int lineNumber) {
             try {
-                Statement stmt      = CCJSqlParserUtil.parse(sql);
-                String type         = getSqlType(stmt);
+                String cleanSql = normalizeSql(sql);
+                Statement stmt  = CCJSqlParserUtil.parse(cleanSql);
+                String type     = getSqlType(stmt);
                 List<String> tables = new TablesNamesFinder().getTableList(stmt);
-                String where        = extractWhere(stmt);
-                addOperation(sourceMethod, new SqlOperation(type, sql, tables, where, sourceMethod));
+                String where    = extractWhere(stmt);
+                addOperation(sourceMethod,
+                    new SqlOperation(type, sql, tables, where, sourceMethod, lineNumber)); // ← line
             } catch (Exception e) {
                 log.warn("JSQLParser failed for '{}' in {}: {}", sql, sourceMethod, e.getMessage());
                 String type = guessSqlType(sql);
-                addOperation(sourceMethod, new SqlOperation(type, sql, List.of(), null, sourceMethod));
+                addOperation(sourceMethod,
+                    new SqlOperation(type, sql, List.of(), null, sourceMethod, lineNumber));
             }
         }
 
-        private void handleJpql(String jpql, String sourceMethod) {
+        private void handleJpql(String jpql, String sourceMethod, int lineNumber) {
             String type = guessSqlType(jpql);
             List<String> tables = new ArrayList<>();
             Pattern entityPattern = Pattern.compile("(?i)(?:UPDATE|FROM|JOIN)\\s+([A-Z][a-zA-Z0-9]*)");
@@ -499,7 +496,15 @@ public class SqlQueryCollector {
                 "(?i)WHERE\\s+(.+?)(?:\\s+ORDER\\s+BY|\\s+GROUP\\s+BY|$)");
             Matcher wm = wherePattern.matcher(jpql);
             if (wm.find()) where = wm.group(1).trim();
-            addOperation(sourceMethod, new SqlOperation(type, jpql, tables, where, sourceMethod));
+            addOperation(sourceMethod,
+                new SqlOperation(type, jpql, tables, where, sourceMethod, lineNumber));
+        }
+
+        private void handleNativeSql(String sql, String sourceMethod) {
+            handleNativeSql(sql, sourceMethod, 0);
+        }
+        private void handleJpql(String jpql, String sourceMethod) {
+            handleJpql(jpql, sourceMethod, 0);
         }
 
         // -----------------------------------------------------------------
@@ -507,7 +512,7 @@ public class SqlQueryCollector {
         // -----------------------------------------------------------------
 
         private boolean handleDerivedQuery(String methodName, String sourceMethod,
-                                           String tableName, String entityName) {
+                                           String tableName, String entityName, int lineNumber) {
             List<String> simpleFields = new ArrayList<>();
             Map<String, Class<?>> typedFields = new LinkedHashMap<>();
 
@@ -662,7 +667,7 @@ public class SqlQueryCollector {
                 }
 
                 addOperation(sourceMethod,
-                    new SqlOperation(type, rawSql, involvedTables, whereCondition, sourceMethod));
+                    new SqlOperation(type, rawSql, involvedTables, whereCondition, sourceMethod, lineNumber));
                 return true;
             } catch (Exception e) {
                 log.debug("PartTree did not recognize '{}' in {}: {}",
@@ -876,5 +881,17 @@ public class SqlQueryCollector {
         private void addOperation(String key, SqlOperation op) {
             result.computeIfAbsent(key, k -> new ArrayList<>()).add(op);
         }
+    }
+
+    private static String normalizeSql(String sql) {
+        if (sql == null) return null;
+        return sql
+            // Remove Hibernate schema prefix: {h-schema}TABLE → TABLE
+            .replaceAll("\\{h-schema\\}", "")
+            // Collapse Java string concatenation artifacts: " + " → space
+            .replaceAll("\"\\s*\\+\\s*\"", " ")
+            // Normalize whitespace
+            .replaceAll("\\s+", " ")
+            .trim();
     }
 }

@@ -75,12 +75,18 @@ public class DeadlockAnalyzerInputGenerator {
                         }
                         stmt.put("parameters", params);
                         stmt.put("resultReference", "res" + globalCounter++);
+                        stmt.put("lineNumber", op.getLineNumber()); // add after resultReference line
 
                         // Triggering code location: join callChain with " → "
-                        String trigLoc = "";
-                        if (rt.getCallChain() != null && !rt.getCallChain().isEmpty()) {
-                            trigLoc = String.join(" → ", rt.getCallChain());
-                        }
+//                        String trigLoc = "";
+//                        if (rt.getCallChain() != null && !rt.getCallChain().isEmpty()) {
+//                            trigLoc = String.join(" → ", rt.getCallChain());
+//                        }
+//                        stmt.put("triggeringCodeLocation", trigLoc);
+
+                        String trigLoc = buildTriggeringLocation(
+                            rt.getCallChain(), op.getSourceMethod(), rt.getTransactionId(),
+                            op.getLineNumber());
                         stmt.put("triggeringCodeLocation", trigLoc);
 
                         stmts.add(stmt);
@@ -151,5 +157,31 @@ public class DeadlockAnalyzerInputGenerator {
             }
         }
         return sb.toString();
+    }
+
+    private String buildTriggeringLocation(List<String> chain, String sourceMethod,
+                                           String transactionId, int lineNumber) {
+        // Embed line in the string — serves as fallback when the analyzer
+        // creates new SQLStatement objects that lose the lineNumber field.
+        String lineSuffix = lineNumber > 0 ? " (line " + lineNumber + ")" : "";
+
+        if (chain == null || chain.isEmpty()) {
+            return sourceMethod != null ? sourceMethod + lineSuffix : "";
+        }
+        if (sourceMethod == null || sourceMethod.isBlank()) {
+            return String.join(" → ", chain);
+        }
+        int rootIdx = 0;
+        for (int i = 0; i < chain.size(); i++) {
+            if (chain.get(i).equals(transactionId)) { rootIdx = i; break; }
+        }
+        int srcIdx = -1;
+        for (int i = rootIdx; i < chain.size(); i++) {
+            if (chain.get(i).equals(sourceMethod)) { srcIdx = i; break; }
+        }
+        if (srcIdx >= 0) {
+            return String.join(" → ", chain.subList(rootIdx, srcIdx + 1)) + lineSuffix;
+        }
+        return transactionId + " → " + sourceMethod + lineSuffix;
     }
 }
