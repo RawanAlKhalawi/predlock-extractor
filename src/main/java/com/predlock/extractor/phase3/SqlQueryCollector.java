@@ -368,6 +368,16 @@ public class SqlQueryCollector {
                         }
 
                         // Form F — EM lifecycle: persist / merge / remove / find
+                        //
+                        // em.merge(detachedEntity) actually issues TWO SQL statements at
+                        // runtime: a SELECT to load the current row state into the
+                        // persistence context (acquires a shared row lock), then an
+                        // UPDATE at flush (acquires an exclusive row lock — a lock
+                        // upgrade). Modeling merge as a single UPDATE collapses that
+                        // pair and hides the lock-upgrade pattern from the deadlock
+                        // analyzer's hold-and-wait check. We therefore emit BOTH
+                        // statements for merge, while persist/remove/find stay as a
+                        // single statement (their runtime semantics are single-op).
                         if (EM_LIFECYCLE_METHODS.containsKey(callName) && !call.getArguments().isEmpty()) {
                             String sqlType  = EM_LIFECYCLE_METHODS.get(callName);
                             Expression arg0 = call.getArgument(0);
@@ -375,12 +385,33 @@ public class SqlQueryCollector {
                             String table = entityHint != null
                                 ? entityModel.getEntityToTable().getOrDefault(entityHint, camelToSnake(entityHint))
                                 : "unknown";
-                            String pseudoSql = sqlType + " INTO/FROM " + table + " (via em." + callName + ")";
-                            int line = call.getBegin().map(p -> p.line).orElse(0); // ← NEW
-                            addOperation(sourceMethod, new SqlOperation(
-                                sqlType, pseudoSql,
-                                table.equals("unknown") ? List.of() : List.of(table),
-                                null, sourceMethod, line)); // ← pass line
+                            int line = call.getBegin().map(p -> p.line).orElse(0);
+                            List<String> tables = table.equals("unknown") ? List.of() : List.of(table);
+
+                            if ("merge".equals(callName)) {
+                                // Implicit SELECT issued by merge to load row state
+                                // (acquires a shared row lock).
+                                addOperation(sourceMethod, new SqlOperation(
+                                    "SELECT",
+                                    "SELECT FROM " + table + " WHERE id = ? (via em.merge implicit fetch)",
+                                    tables,
+                                    "id = ?",
+                                    sourceMethod, line));
+                                // UPDATE issued at flush to persist merged state
+                                // (acquires an exclusive row lock — lock upgrade).
+                                addOperation(sourceMethod, new SqlOperation(
+                                    "UPDATE",
+                                    "UPDATE " + table + " SET ... WHERE id = ? (via em.merge)",
+                                    tables,
+                                    "id = ?",
+                                    sourceMethod, line));
+                            } else {
+                                String pseudoSql = sqlType + " INTO/FROM " + table + " (via em." + callName + ")";
+                                addOperation(sourceMethod, new SqlOperation(
+                                    sqlType, pseudoSql,
+                                    tables,
+                                    null, sourceMethod, line));
+                            }
                             return;
                         }
 

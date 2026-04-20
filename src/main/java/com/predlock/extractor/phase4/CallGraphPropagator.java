@@ -6,6 +6,7 @@ import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.ast.stmt.ExpressionStmt;
@@ -25,19 +26,6 @@ import java.util.*;
 
 /**
  * Phase 4: Propagates SQL operations through the call graph into transaction boundaries.
- *
- * <h3>Line number strategy</h3>
- * Line numbers are captured at the SERVICE call site (i.e. the exact line in
- * {@code DeadlockScenario3Service} where {@code productRepository.deleteByName()} is
- * invoked), NOT at the repository method declaration.
- *
- * <p>When the same repository method is called more than once in a service method
- * (e.g. two calls to {@code save()}), occurrence-based keys are used so each call site
- * gets its own line number:
- * <pre>
- *   callSiteLines["sig|repo.save#1"] = 37   ← INSERT (new object)
- *   callSiteLines["sig|repo.save#2"] = 59   ← UPDATE (existing object)
- * </pre>
  */
 public class CallGraphPropagator {
 
@@ -70,10 +58,6 @@ public class CallGraphPropagator {
         "AbstractModuleConfiguration"
     );
 
-    // -------------------------------------------------------------------------
-    // Public entry point
-    // -------------------------------------------------------------------------
-
     public List<ResolvedTransaction> propagate(List<TransactionTemplate> templates,
                                                Map<String, List<SqlOperation>> sqlMap,
                                                EntityModel entityModel,
@@ -82,14 +66,21 @@ public class CallGraphPropagator {
         Map<String, String>  saveFetchSources  = new HashMap<>();
         Map<String, String>  fieldToType       = new HashMap<>();
         Set<String>          newObjectVariables = new HashSet<>();
-
-        // Key: "callerSig|calledMethod#occurrence" → source line in SERVICE
-        // Also: "callerSig|calledMethod" → line of LAST occurrence (fallback)
         Map<String, Integer> callSiteLines = new HashMap<>();
+
+        // Static Java type of each method call's receiver expression, keyed by
+        // "callerSig|calledMethod#occurrence" (with a "callerSig|calledMethod"
+        // fallback). Used by inferImplicitSql to avoid setter-name collisions:
+        // e.g. customer.setPassword must resolve to Customer (not AdminUser),
+        // newAsset.setName to StaticAsset (not Store). A null entry here means
+        // the receiver could not be resolved statically, in which case
+        // inferImplicitSql skips emission rather than guessing by field name.
+        Map<String, String>  callReceiverTypes = new HashMap<>();
 
         Map<String, List<String>> callGraph = buildCallGraph(
             projectPath, saveCallTypes, saveFetchSources,
-            fieldToType, newObjectVariables, callSiteLines);
+            fieldToType, newObjectVariables, callSiteLines,
+            callReceiverTypes);
 
         Map<String, TransactionTemplate> templateMap = new HashMap<>();
         for (TransactionTemplate t : templates) {
@@ -110,13 +101,11 @@ public class CallGraphPropagator {
             walkCallGraph(template.getMethodSignature(), callGraph, sqlMap, entityModel,
                 templateMap, template, orderedStatements, callChain, visited,
                 saveCallTypes, saveFetchSources, fieldToType, newObjectVariables,
-                callSiteLines);
+                callSiteLines, callReceiverTypes);
 
-            // Merge setter-inferred UPDATEs on same table → single JPA flush UPDATE
             List<SqlOperation> merged = mergeImplicitSetterUpdates(
                 orderedStatements, template.getMethodSignature());
 
-            // Deduplicate: same type + rawSql + tables → keep first occurrence
             List<SqlOperation> deduped = new ArrayList<>();
             Set<String>        seen    = new HashSet<>();
             for (SqlOperation op : merged) {
@@ -124,7 +113,6 @@ public class CallGraphPropagator {
                 if (seen.add(key)) deduped.add(op);
             }
 
-            // Deduplicate callChain
             List<String> dedupedChain = new ArrayList<>();
             Set<String>  seenMethods  = new HashSet<>();
             for (String method : callChain) {
@@ -149,28 +137,13 @@ public class CallGraphPropagator {
     private static final Set<String> FIND_PREFIXES = Set.of(
         "find", "get", "query", "search", "read", "stream", "count", "exists");
 
-    // -------------------------------------------------------------------------
-    // STEP 1: Build call graph with occurrence-based call site lines
-    // -------------------------------------------------------------------------
-
-    /**
-     * Builds the call graph and populates {@code callSiteLines}.
-     *
-     * <p>For each method call expression encountered in a service method, two entries
-     * are written into {@code callSiteLines}:
-     * <ul>
-     *   <li>{@code "callerSig|calledMethod#N"} → line of the N-th occurrence</li>
-     *   <li>{@code "callerSig|calledMethod"}   → line of the last occurrence (fallback)</li>
-     * </ul>
-     * Method calls are sorted by source line before assignment so that occurrence
-     * numbers always correspond to top-to-bottom order in the source file.
-     */
     private Map<String, List<String>> buildCallGraph(String projectPath,
                                                      Map<String, String> saveCallTypes,
                                                      Map<String, String> saveFetchSources,
                                                      Map<String, String> fieldToType,
                                                      Set<String> newObjectVariables,
-                                                     Map<String, Integer> callSiteLines) {
+                                                     Map<String, Integer> callSiteLines,
+                                                     Map<String, String> callReceiverTypes) {
         Map<String, List<String>> callGraph = new HashMap<>();
         if (projectPath == null) return callGraph;
 
@@ -213,8 +186,6 @@ public class CallGraphPropagator {
                             }
                         }
 
-                        // Sort all call expressions by source line so occurrence numbers
-                        // always correspond to top-to-bottom order in the source file.
                         List<MethodCallExpr> sortedCalls = method.findAll(MethodCallExpr.class)
                             .stream()
                             .sorted(Comparator.comparingInt(
@@ -222,11 +193,14 @@ public class CallGraphPropagator {
                             .toList();
 
                         List<String>       calls              = new ArrayList<>();
-                        // Per-method occurrence counter for each called method string
                         Map<String, Integer> callOccurrence   = new HashMap<>();
 
                         for (MethodCallExpr mce : sortedCalls) {
                             int callLine = mce.getBegin().map(p -> p.line).orElse(0);
+
+                            // Resolve the receiver's static Java type once per call expression.
+                            // Result may be null (chained expressions, static calls, etc.).
+                            String receiverType = resolveReceiverStaticType(mce, method, fieldTypes);
 
                             String callStr;
                             if (mce.getScope().isPresent()) {
@@ -236,20 +210,26 @@ public class CallGraphPropagator {
                                 String resolvedType = fieldTypes.get(scopeName);
                                 if (resolvedType != null && !resolvedType.equals(scopeName)) {
                                     String resolvedCallStr = resolvedType + "." + mce.getNameAsString();
-                                    // Occurrence-based key for resolved form
                                     int rOcc = callOccurrence.merge(resolvedCallStr, 1, Integer::sum);
                                     callSiteLines.put(sig + "|" + resolvedCallStr + "#" + rOcc, callLine);
                                     callSiteLines.put(sig + "|" + resolvedCallStr, callLine); // last-write fallback
+                                    if (receiverType != null) {
+                                        callReceiverTypes.put(sig + "|" + resolvedCallStr + "#" + rOcc, receiverType);
+                                        callReceiverTypes.put(sig + "|" + resolvedCallStr, receiverType);
+                                    }
                                     calls.add(resolvedCallStr);
                                 }
                             } else {
                                 callStr = mce.getNameAsString();
                             }
 
-                            // Occurrence-based key for field-name (or unscoped) form
                             int occ = callOccurrence.merge(callStr, 1, Integer::sum);
                             callSiteLines.put(sig + "|" + callStr + "#" + occ, callLine);
                             callSiteLines.put(sig + "|" + callStr, callLine); // last-write fallback
+                            if (receiverType != null) {
+                                callReceiverTypes.put(sig + "|" + callStr + "#" + occ, receiverType);
+                                callReceiverTypes.put(sig + "|" + callStr, receiverType);
+                            }
                             calls.add(callStr);
                         }
                         callGraph.put(sig, calls);
@@ -263,10 +243,6 @@ public class CallGraphPropagator {
         }
         return callGraph;
     }
-
-    // -------------------------------------------------------------------------
-    // Save call analysis
-    // -------------------------------------------------------------------------
 
     private void analyzeSaveCalls(MethodDeclaration method, String methodSig,
                                   Map<String, String> saveCallTypes,
@@ -406,32 +382,47 @@ public class CallGraphPropagator {
                                        MethodCallExpr saveCall) {
         int saveLineNo = saveCall.getBegin().map(p -> p.line).orElse(Integer.MAX_VALUE);
 
-        for (int i = statements.size() - 1; i >= 0; i--) {
-            Statement stmt   = statements.get(i);
-            int stmtLine     = stmt.getBegin().map(p -> p.line).orElse(0);
-            if (stmtLine >= saveLineNo) continue;
-            if (!(stmt instanceof ExpressionStmt exprStmt)) continue;
-
-            Expression expr = exprStmt.getExpression();
-
-            if (expr instanceof VariableDeclarationExpr vde) {
-                for (VariableDeclarator vd : vde.getVariables()) {
-                    if (vd.getNameAsString().equals(varName) && vd.getInitializer().isPresent()) {
-                        return classifyInitializer(vd.getInitializer().get());
-                    }
+        // Walk ALL VariableDeclarators in the enclosing method (not just top-level
+        // statements), since `T history = new T(...)` may be nested inside an
+        // if/for/try block. Pick the declarator with the largest line number that
+        // is still < saveLineNo (handles shadowing and reassignment patterns).
+        MethodDeclaration enclosing = saveCall.findAncestor(MethodDeclaration.class).orElse(null);
+        if (enclosing != null) {
+            VariableDeclarator best = null;
+            int bestLine = -1;
+            for (VariableDeclarator vd : enclosing.findAll(VariableDeclarator.class)) {
+                if (!vd.getNameAsString().equals(varName)) continue;
+                if (!vd.getInitializer().isPresent()) continue;
+                int line = vd.getBegin().map(p -> p.line).orElse(-1);
+                if (line >= 0 && line < saveLineNo && line > bestLine) {
+                    bestLine = line;
+                    best = vd;
                 }
             }
-            if (expr instanceof AssignExpr assignExpr) {
-                if (assignExpr.getTarget().toString().equals(varName)) {
-                    return classifyInitializer(assignExpr.getValue());
+            if (best != null) {
+                return classifyInitializer(best.getInitializer().get());
+            }
+
+            // Also walk all assignments in the method body. Pick the latest one
+            // before the save call.
+            AssignExpr bestAssign = null;
+            int bestAssignLine = -1;
+            for (AssignExpr ae : enclosing.findAll(AssignExpr.class)) {
+                if (!ae.getTarget().toString().equals(varName)) continue;
+                int line = ae.getBegin().map(p -> p.line).orElse(-1);
+                if (line >= 0 && line < saveLineNo && line > bestAssignLine) {
+                    bestAssignLine = line;
+                    bestAssign = ae;
                 }
             }
-        }
+            if (bestAssign != null && bestAssignLine > bestLine) {
+                return classifyInitializer(bestAssign.getValue());
+            }
 
-        for (var param : saveCall.findAncestor(MethodDeclaration.class)
-            .map(MethodDeclaration::getParameters)
-            .orElse(new com.github.javaparser.ast.NodeList<>())) {
-            if (param.getNameAsString().equals(varName)) return "UPDATE";
+            // Method parameters fall through to UPDATE (entity passed in).
+            for (Parameter p : enclosing.getParameters()) {
+                if (p.getNameAsString().equals(varName)) return "UPDATE";
+            }
         }
 
         return "UPDATE";
@@ -465,10 +456,6 @@ public class CallGraphPropagator {
         return false;
     }
 
-    // -------------------------------------------------------------------------
-    // STEP 2 & 3: Walk call graph
-    // -------------------------------------------------------------------------
-
     private void walkCallGraph(String methodSig,
                                Map<String, List<String>> callGraph,
                                Map<String, List<SqlOperation>> sqlMap,
@@ -482,7 +469,8 @@ public class CallGraphPropagator {
                                Map<String, String> saveFetchSources,
                                Map<String, String> fieldToType,
                                Set<String> newObjectVariables,
-                               Map<String, Integer> callSiteLines) {
+                               Map<String, Integer> callSiteLines,
+                               Map<String, String> callReceiverTypes) {
         if (visited.contains(methodSig)) return;
         visited.add(methodSig);
         callChain.add(methodSig);
@@ -503,10 +491,8 @@ public class CallGraphPropagator {
         Map<String, Integer> walkCallOccurrence = new HashMap<>();
 
         for (String calledMethod : calledMethods) {
-            // Increment general occurrence counter — must mirror buildCallGraph order
             int callOcc = walkCallOccurrence.merge(calledMethod, 1, Integer::sum);
 
-            // Maintain save-specific occurrence for inferSaveType
             int dotIdx = calledMethod.lastIndexOf('.');
             if (dotIdx > 0 && SAVE_METHODS.contains(calledMethod.substring(dotIdx + 1))) {
                 String scopePart = calledMethod.substring(0, dotIdx);
@@ -520,19 +506,22 @@ public class CallGraphPropagator {
                 continue;
             }
 
-            // Resolve call site line BEFORE inferImplicitSql so we can stamp
-            // each newly emitted setter UPDATE with its own source line immediately.
-            // This is more precise than relying on inferSaveType's stamp (which runs
-            // later and uses the save() line instead of the setter's own line).
             int callSiteLine = callSiteLines.getOrDefault(
                 methodSig + "|" + calledMethod + "#" + callOcc,
                 callSiteLines.getOrDefault(methodSig + "|" + calledMethod, 0));
 
             if (!isSetterOnNewObject(calledMethod, methodSig, newObjectVariables)) {
-                int sizeBefore = orderedStatements.size();
-                inferImplicitSql(calledMethod, entityModel, rootTemplate, orderedStatements);
+                // Look up the static type of the receiver expression. null means
+                // the call was chained / unresolvable (e.g. a.getB().setC(...)),
+                // in which case inferImplicitSql will skip emission.
+                String receiverType = callReceiverTypes.getOrDefault(
+                    methodSig + "|" + calledMethod + "#" + callOcc,
+                    callReceiverTypes.get(methodSig + "|" + calledMethod));
 
-                // Stamp newly emitted setter UPDATEs with the setter's own call site line.
+                int sizeBefore = orderedStatements.size();
+                inferImplicitSql(calledMethod, entityModel, rootTemplate,
+                    orderedStatements, receiverType);
+
                 if (callSiteLine > 0) {
                     for (int i = sizeBefore; i < orderedStatements.size(); i++) {
                         SqlOperation newOp = orderedStatements.get(i);
@@ -557,13 +546,20 @@ public class CallGraphPropagator {
                                 methodSig + "|" + resolvedKey + "#" + callOcc,
                                 callSiteLines.getOrDefault(methodSig + "|" + resolvedKey, 0));
                         }
+                        // Fallback: Phase 3 emits SQL ops for em.merge / @Query / etc. keyed
+                        // under the IMPLEMENTING class (e.g. CustomerDaoImpl.save), but the
+                        // calling field is typically declared as the INTERFACE
+                        // (e.g. customerDao : CustomerDao). Try the conventional "Impl"
+                        // suffix so Phase 3's emissions reach interface-typed callers.
+                        if (calledOps == null && !typeName.endsWith("Impl")) {
+                            String implKey = typeName + "Impl" + calledMethod.substring(dot);
+                            calledOps = sqlMap.get(implKey);
+                        }
                     }
                 }
             }
 
             if (calledOps != null) {
-                // Copy ops with service-side call site line stamped.
-                // Never mutate shared sqlMap entries — they are reused for T1, T2, ...
                 for (SqlOperation op : calledOps) {
                     int effectiveLine = callSiteLine > 0 ? callSiteLine : op.getLineNumber();
                     orderedStatements.add(new SqlOperation(
@@ -575,8 +571,6 @@ public class CallGraphPropagator {
             } else if (callSiteLine > 0
                 && isFindMethodCall(calledMethod)
                 && isRepositoryCall(calledMethod, fieldToType)) {
-                // Inherited find methods (findById, etc.) are not in sqlMap.
-                // Emit a synthetic SELECT stamped with the service-side call line.
                 String tableName = inferTableFromCall(calledMethod, entityModel, fieldToType);
                 if (tableName != null) {
                     orderedStatements.add(new SqlOperation(
@@ -606,14 +600,61 @@ public class CallGraphPropagator {
                 walkCallGraph(calledMethod, callGraph, sqlMap, entityModel,
                     templateMap, rootTemplate, orderedStatements, callChain, visited,
                     saveCallTypes, saveFetchSources, fieldToType, newObjectVariables,
-                    callSiteLines);
+                    callSiteLines, callReceiverTypes);
             }
         }
     }
 
-    // -------------------------------------------------------------------------
-    // inferSaveType
-    // -------------------------------------------------------------------------
+
+    /**
+     * Models Hibernate's {@code em.merge(detachedEntity)} (and Spring Data
+     * {@code repository.save(existingEntity)} on top of it) as the
+     * SELECT-then-UPDATE pair it actually is at runtime.
+     *
+     * <p>The runtime sequence inside merge is:
+     * <ol>
+     *   <li><b>SELECT</b> the row to load its current state into the
+     *       persistence context — acquires a shared row lock.</li>
+     *   <li><b>UPDATE</b> the row at flush — wants an exclusive row lock,
+     *       upgrading from the shared lock just held.</li>
+     * </ol>
+     * Two concurrent calls each take the shared lock, then both want to
+     * upgrade — a textbook hold-and-wait cycle that the WeSEER analyzer
+     * recognises as a real deadlock. Modeling save as a single UPDATE
+     * statement collapses this pair and makes the analyzer reject the
+     * cycle for failing the hold-and-wait structural check.
+     *
+     * <p>The helper is a no-op when {@code orderedStatements} already
+     * contains a SELECT on {@code tableName}: the entity is already loaded
+     * in the persistence context (via an explicit find, an earlier merge,
+     * a Phase 3 emission propagated through the call graph, or a
+     * fetchSource trace) and merge would not re-fetch.
+     *
+     * <p>The SELECT is inserted at position 0 so it precedes any setter
+     * UPDATEs that were emitted earlier during the walk. After
+     * {@link #mergeImplicitSetterUpdates}, the result for a typical
+     * saveCustomer-style method is the clean two-statement transaction
+     * {@code [SELECT, UPDATE_combined]}.
+     */
+    private void emitImplicitMergeSelect(List<SqlOperation> orderedStatements,
+                                         String tableName,
+                                         String sourceMethod,
+                                         int callSiteLine) {
+        if (tableName == null) return;
+
+        for (SqlOperation op : orderedStatements) {
+            if ("SELECT".equals(op.getType())
+                && op.getTables() != null
+                && op.getTables().contains(tableName)) {
+                return; // already loaded in the persistence context
+            }
+        }
+
+        orderedStatements.add(0, new SqlOperation(
+            "SELECT",
+            "SELECT * FROM " + tableName + " WHERE id = ?",
+            List.of(tableName), "id = ?", sourceMethod, callSiteLine));
+    }
 
     private void inferSaveType(String calledMethod, String callerMethodSig,
                                Map<String, String> saveCallTypes,
@@ -636,9 +677,6 @@ public class CallGraphPropagator {
         if (type == null) type = saveCallTypes.get(calledMethod);
         if (type == null) return;
 
-        // When this save() is an UPDATE, stamp the save's callSiteLine onto any
-        // setter-inferred UPDATE ops that don't yet have a line number.
-        // This ensures mergeImplicitSetterUpdates() can propagate the line to the merged op.
         if ("UPDATE".equals(type) && callSiteLine > 0) {
             for (SqlOperation op : orderedStatements) {
                 if ("UPDATE".equals(op.getType())
@@ -669,11 +707,9 @@ public class CallGraphPropagator {
                     String repoScope = calledMethod.substring(0, dotIdx);
                     String tableName = inferTableFromRepo(repoScope, entityModel, fieldToType);
                     if (tableName != null) {
-                        // Look up the fetch source's OWN call site line (e.g. findById's line),
-                        // not the save()'s line.
                         int fetchLine = callSiteLines.getOrDefault(
                             callerMethodSig + "|" + fetchSource,
-                            callSiteLine); // fall back to save line only if we can't find the fetch line
+                            callSiteLine);
                         orderedStatements.add(0, new SqlOperation(
                             "SELECT",
                             "SELECT * FROM " + tableName + " WHERE id = ?",
@@ -681,7 +717,20 @@ public class CallGraphPropagator {
                     }
                 }
             }
-        }
+
+            // Even when no explicit fetchSource was traced (typical for service
+            // methods that take the entity as a parameter, e.g. saveCustomer(c)),
+            // Hibernate's em.merge(detachedEntity) issues an implicit SELECT
+            // before the flush UPDATE. Inject it now so the lock-upgrade pattern
+            // becomes visible to the WeSEER analyzer's hold-and-wait check.
+            // The helper is a no-op when a SELECT on the target table already
+            // precedes the save (covers explicit-find, fetchSource, and Phase 3
+            // propagation cases).
+            String mergeRepoScope = calledMethod.substring(0, dotIdx);
+            String mergeTable = inferTableFromRepo(mergeRepoScope, entityModel, fieldToType);
+            if ("UPDATE".equals(type)) {
+                emitImplicitMergeSelect(orderedStatements, mergeTable, calledMethod, callSiteLine);
+            }        }
 
         boolean foundMatchingOp = false;
         for (SqlOperation op : orderedStatements) {
@@ -763,10 +812,6 @@ public class CallGraphPropagator {
         return sb.toString();
     }
 
-    // -------------------------------------------------------------------------
-    // inferTableFromRepo
-    // -------------------------------------------------------------------------
-
     private String inferTableFromRepo(String repoName, EntityModel entityModel,
                                       Map<String, String> fieldToType) {
         String typeName = fieldToType.getOrDefault(repoName, repoName);
@@ -796,97 +841,219 @@ public class CallGraphPropagator {
         return camelToSnake(base);
     }
 
-    // -------------------------------------------------------------------------
-    // STEP 3: Infer implicit SQL from getter/setter calls
-    // -------------------------------------------------------------------------
-
+    /**
+     * Emits implicit SQL for getter / setter calls against a JPA entity.
+     *
+     * <p><b>Scoped lookup (fix for setter-name collisions).</b>
+     * The previous implementation iterated all of {@code entityModel.getFieldToColumn()}
+     * and stopped at the first key ending with {@code ".<fieldName>"}. That strategy
+     * produced phantom UPDATE edges whenever multiple entities declared a setter of
+     * the same name (e.g. {@code Customer.setPassword} vs {@code AdminUser.setPassword},
+     * {@code StaticAsset.setName} vs {@code Store.setName},
+     * {@code IdGeneration.setType} vs {@code ProductOption.setType}).
+     *
+     * <p>We now require a resolved static type for the receiver and look up the field
+     * only under that type's key. If {@code receiverStaticType} is null (chained call,
+     * static method, unresolvable scope) or does not correspond to a known
+     * {@code @Entity}, we skip emission rather than guess. This intentionally costs a
+     * small number of true positives (e.g. setters reached only through casted scopes
+     * the resolver could not infer) in exchange for eliminating an entire class of
+     * phantom deadlocks.
+     *
+     * @param receiverStaticType simple or fully-qualified type name of the receiver
+     *                           expression as seen at the call site; may be null
+     */
     private void inferImplicitSql(String calledMethod, EntityModel entityModel,
                                   TransactionTemplate rootTemplate,
-                                  List<SqlOperation> orderedStatements) {
+                                  List<SqlOperation> orderedStatements,
+                                  String receiverStaticType) {
         int dotIdx = calledMethod.lastIndexOf('.');
         if (dotIdx < 0) return;
 
         String methodName = calledMethod.substring(dotIdx + 1);
 
+        // Accessors (get / set) make sense only against an @Entity receiver.
+        // If we cannot prove that, don't emit anything.
+        boolean isGetter = methodName.startsWith("get") && methodName.length() > 3;
+        boolean isSetter = methodName.startsWith("set") && methodName.length() > 3
+            && !rootTemplate.isReadOnly();
+        if (!isGetter && !isSetter) return;
+
+        String entityKey = findEntityKey(receiverStaticType, entityModel);
+        if (entityKey == null) {
+            // Receiver is a DTO, primitive, @Transient field holder, or an
+            // unresolvable expression. Do not emit implicit SQL.
+            return;
+        }
+
+        if (IMPLICIT_UPDATE_ENTITY_BLACKLIST.contains(entityKey)) {
+            log.debug("Skipping implicit SQL for blacklisted entity '{}'", entityKey);
+            return;
+        }
+
+        String fieldName =
+            Character.toLowerCase(methodName.charAt(3)) + methodName.substring(4);
+
+        // Try the resolved key first, then its Impl/base counterpart, since the
+        // entity model may index fields under either form.
+        String altKey = entityKey.endsWith("Impl")
+            ? entityKey.substring(0, entityKey.length() - 4)
+            : entityKey + "Impl";
+
         // IMPLICIT SELECT: entity.getXxx() where xxx is a LAZY relationship
-        if (methodName.startsWith("get") && methodName.length() > 3) {
-            String fieldName =
-                Character.toLowerCase(methodName.charAt(3)) + methodName.substring(4);
-
-            for (Map.Entry<String, RelationshipInfo> entry : entityModel.getRelationships().entrySet()) {
-                String key           = entry.getKey();
-                RelationshipInfo rel = entry.getValue();
-
-                if (key.endsWith("." + fieldName) && "LAZY".equals(rel.getFetchType())) {
-                    String targetEntity = rel.getTargetEntity();
-                    String tableName = entityModel.getEntityToTable().getOrDefault(
-                        targetEntity,
-                        targetEntity != null ? targetEntity.toLowerCase() : "unknown");
-                    String joinCol = rel.getJoinColumn() != null ? rel.getJoinColumn() : "id";
-
-                    orderedStatements.add(new SqlOperation(
-                        "SELECT",
-                        "SELECT * FROM " + tableName + " WHERE " + joinCol + " = ?",
-                        List.of(tableName), joinCol + " = ?", calledMethod));
-                    break;
-                }
+        if (isGetter) {
+            RelationshipInfo rel = entityModel.getRelationships().get(entityKey + "." + fieldName);
+            if (rel == null) {
+                rel = entityModel.getRelationships().get(altKey + "." + fieldName);
             }
+            if (rel == null || !"LAZY".equals(rel.getFetchType())) return;
+
+            String targetEntity = rel.getTargetEntity();
+            String tableName = entityModel.getEntityToTable().getOrDefault(
+                targetEntity,
+                targetEntity != null ? targetEntity.toLowerCase() : "unknown");
+            String joinCol = rel.getJoinColumn() != null ? rel.getJoinColumn() : "id";
+
+            orderedStatements.add(new SqlOperation(
+                "SELECT",
+                "SELECT * FROM " + tableName + " WHERE " + joinCol + " = ?",
+                List.of(tableName), joinCol + " = ?", calledMethod));
+            return;
         }
 
-        // IMPLICIT UPDATE: entity.setXxx() in a non-readOnly transaction.
-        // Only emit ONE UPDATE per table — Hibernate dirty-checking flushes all
-        // field changes in a single SQL statement.
-        if (methodName.startsWith("set") && methodName.length() > 3 && !rootTemplate.isReadOnly()) {
-            String fieldName =
-                Character.toLowerCase(methodName.charAt(3)) + methodName.substring(4);
-
-            for (Map.Entry<String, String> entry : entityModel.getFieldToColumn().entrySet()) {
-                String key        = entry.getKey();
-                String columnName = entry.getValue();
-
-                if (key.endsWith("." + fieldName)) {
-                    String entityClassName = key.substring(0, key.indexOf('.'));
-                    String tableName = entityModel.getEntityToTable().getOrDefault(
-                        entityClassName, entityClassName.toLowerCase());
-
-                    if (IMPLICIT_UPDATE_ENTITY_BLACKLIST.contains(entityClassName)) {
-                        log.debug("Skipping implicit UPDATE for blacklisted entity '{}'",
-                            entityClassName);
-                        continue;
-                    }
-
-//                    boolean updateAlreadyPresent = orderedStatements.stream().anyMatch(op ->
-//                        "UPDATE".equals(op.getType())
-//                            && op.getTables() != null
-//                            && op.getTables().contains(tableName));
-//
-//                    if (updateAlreadyPresent) {
-//                        log.debug("Skipping duplicate implicit UPDATE for table '{}' "
-//                            + "— UPDATE already registered", tableName);
-//                        break;
-//                    }
-
-                    orderedStatements.add(new SqlOperation(
-                        "UPDATE",
-                        "UPDATE " + tableName + " SET " + columnName + " = ? WHERE id = ?",
-                        List.of(tableName), "id = ?", calledMethod));
-                    break;
-                }
-            }
+        // IMPLICIT UPDATE: entity.setXxx() on a persistent (non-@Transient) field.
+        // Only emit ONE UPDATE per table; Hibernate dirty-checking flushes all
+        // changed fields of a given entity in a single SQL statement (the
+        // mergeImplicitSetterUpdates pass collapses multiple setter emissions
+        // for the same table into a single combined UPDATE).
+        String columnName = entityModel.getFieldToColumn().get(entityKey + "." + fieldName);
+        if (columnName == null) {
+            columnName = entityModel.getFieldToColumn().get(altKey + "." + fieldName);
         }
+        if (columnName == null) {
+            // Field is not persistent on this entity (e.g. it is @Transient, or the
+            // method name does not correspond to a mapped column at all). Skip.
+            return;
+        }
+
+        String tableName = entityModel.getEntityToTable().get(entityKey);
+        if (tableName == null) tableName = entityModel.getEntityToTable().get(altKey);
+        if (tableName == null) return;
+
+        orderedStatements.add(new SqlOperation(
+            "UPDATE",
+            "UPDATE " + tableName + " SET " + columnName + " = ? WHERE id = ?",
+            List.of(tableName), "id = ?", calledMethod));
     }
 
     // -------------------------------------------------------------------------
-    // Merge implicit setter UPDATEs → single JPA flush UPDATE
+    // Static-type resolution helpers (introduced for the setter-collision fix)
     // -------------------------------------------------------------------------
 
     /**
-     * Merges multiple implicit setter-inferred UPDATEs on the same table into one.
+     * Resolves the static Java type of {@code mce}'s receiver expression.
      *
-     * <p>The merged op is attributed to {@code transactionMethodSig}.
-     * Its line number is taken from the first setter that has a non-zero line
-     * (stamped by {@link #inferSaveType} using the save() call's line).
+     * <p>Supported shapes:
+     * <ul>
+     *   <li>{@code ((Foo) x).bar()} and {@code (Foo) x} — cast expression</li>
+     *   <li>{@code x.bar()} where {@code x} is a parameter, a local variable, or a field</li>
+     *   <li>{@code this.bar()} / {@code bar()} (implicit this) — the enclosing class</li>
+     *   <li>{@code new Foo().bar()} — the constructed type</li>
+     * </ul>
+     * Everything else (chained calls, static method access, array access, etc.)
+     * returns null, and the caller must treat that as "cannot resolve" and skip
+     * anything that depends on the receiver's entity identity.
      */
+    private String resolveReceiverStaticType(MethodCallExpr mce, MethodDeclaration method,
+                                             Map<String, String> fieldTypes) {
+        if (mce == null || method == null) return null;
+
+        // Implicit this: foo() called from inside the enclosing class.
+        if (!mce.getScope().isPresent()) {
+            return method.findAncestor(ClassOrInterfaceDeclaration.class)
+                .map(ClassOrInterfaceDeclaration::getNameAsString).orElse(null);
+        }
+
+        Expression scope = mce.getScope().get();
+        // Unwrap parentheses like ((Foo) x).bar().
+        while (scope instanceof EnclosedExpr ee) {
+            scope = ee.getInner();
+        }
+
+        if (scope instanceof CastExpr ce) {
+            return ce.getType().asString();
+        }
+        if (scope instanceof ObjectCreationExpr oce) {
+            return oce.getType().asString();
+        }
+        if (scope instanceof ThisExpr) {
+            return method.findAncestor(ClassOrInterfaceDeclaration.class)
+                .map(ClassOrInterfaceDeclaration::getNameAsString).orElse(null);
+        }
+        if (scope instanceof NameExpr ne) {
+            String name = ne.getNameAsString();
+
+            // Method parameters.
+            for (Parameter p : method.getParameters()) {
+                if (p.getNameAsString().equals(name)) {
+                    return p.getType().asString();
+                }
+            }
+
+            // Local variables: pick the declaration with the greatest begin-line
+            // that is still before the call, which correctly handles the common
+            // "reassign then call" pattern and the dominant case of no shadowing.
+            int callLine = mce.getBegin().map(p -> p.line).orElse(Integer.MAX_VALUE);
+            VariableDeclarator best = null;
+            int bestLine = -1;
+            for (VariableDeclarator vd : method.findAll(VariableDeclarator.class)) {
+                if (!vd.getNameAsString().equals(name)) continue;
+                int line = vd.getBegin().map(p -> p.line).orElse(-1);
+                if (line <= callLine && line > bestLine) {
+                    bestLine = line;
+                    best = vd;
+                }
+            }
+            if (best != null) return best.getType().asString();
+
+            // Fields of the enclosing service class.
+            return fieldTypes.get(name);
+        }
+
+        // Chained calls (a.b().c()), field accesses (obj.field.x()), array
+        // access, etc. — not resolved statically.
+        return null;
+    }
+
+    /**
+     * Normalises {@code typeName} and returns a key under which
+     * {@code entityModel.getEntityToTable()} has an entry, or null if no such
+     * entry exists. Tries the plain name first, then the conventional
+     * {@code Impl} suffix used by Broadleaf-style domains.
+     */
+    private String findEntityKey(String typeName, EntityModel entityModel) {
+        if (typeName == null) return null;
+
+        // Strip qualified prefix (e.g. org.foo.Bar -> Bar).
+        int lastDot = typeName.lastIndexOf('.');
+        if (lastDot >= 0) typeName = typeName.substring(lastDot + 1);
+        // Strip generic parameters (e.g. List<Foo> -> List).
+        int lt = typeName.indexOf('<');
+        if (lt >= 0) typeName = typeName.substring(0, lt);
+        typeName = typeName.trim();
+        if (typeName.isEmpty()) return null;
+
+        if (entityModel.getEntityToTable().containsKey(typeName)) return typeName;
+        if (entityModel.getEntityToTable().containsKey(typeName + "Impl")) {
+            return typeName + "Impl";
+        }
+        if (typeName.endsWith("Impl")) {
+            String base = typeName.substring(0, typeName.length() - 4);
+            if (entityModel.getEntityToTable().containsKey(base)) return base;
+        }
+        return null;
+    }
+
     private List<SqlOperation> mergeImplicitSetterUpdates(List<SqlOperation> ops,
                                                           String transactionMethodSig) {
         if (ops == null || ops.size() < 2) return ops;
@@ -933,7 +1100,6 @@ public class CallGraphPropagator {
                 String mergedSql = "UPDATE " + table + " SET "
                     + String.join(", ", setCols) + " WHERE id = ?";
 
-                // Use the line from the first setter that has one (stamped by inferSaveType)
                 int mergedLine = group.stream()
                     .mapToInt(SqlOperation::getLineNumber)
                     .filter(l -> l > 0)
@@ -969,10 +1135,6 @@ public class CallGraphPropagator {
         return col.isEmpty() ? java.util.Optional.empty() : java.util.Optional.of(col);
     }
 
-    // -------------------------------------------------------------------------
-    // Utility
-    // -------------------------------------------------------------------------
-
     private static String camelToSnake(String camel) {
         if (camel == null || camel.isEmpty()) return camel;
         StringBuilder sb = new StringBuilder();
@@ -988,10 +1150,6 @@ public class CallGraphPropagator {
         return sb.toString();
     }
 
-    /**
-     * Returns true if the called method is a find/get/query repository call
-     * that would be inherited (not declared in the project's own repo interface).
-     */
     private boolean isFindMethodCall(String calledMethod) {
         int dot = calledMethod.lastIndexOf('.');
         if (dot < 0) return false;
@@ -999,10 +1157,6 @@ public class CallGraphPropagator {
         return isFindMethod(methodName);
     }
 
-    /**
-     * Resolves the table name from a repository call string like
-     * "ProductRepository.findById" or "productRepository.findById".
-     */
     private String inferTableFromCall(String calledMethod, EntityModel entityModel,
                                       Map<String, String> fieldToType) {
         int dot = calledMethod.lastIndexOf('.');
@@ -1011,20 +1165,14 @@ public class CallGraphPropagator {
         return inferTableFromRepo(scope, entityModel, fieldToType);
     }
 
-    /**
-     * Returns true only if the scope of the called method resolves to a
-     * repository/DAO type — not an entity or service bean.
-     */
     private boolean isRepositoryCall(String calledMethod, Map<String, String> fieldToType) {
         int dot = calledMethod.lastIndexOf('.');
         if (dot < 0) return false;
         String scope    = calledMethod.substring(0, dot);
         String typeName = fieldToType.getOrDefault(scope, scope);
-        // Reject service/manager/helper beans
         for (String suffix : NON_REPO_SUFFIXES) {
             if (typeName.endsWith(suffix)) return false;
         }
-        // Must end with a known DAO/Repository suffix
         for (String suffix : DAO_TYPE_SUFFIXES) {
             if (typeName.endsWith(suffix)) return true;
         }

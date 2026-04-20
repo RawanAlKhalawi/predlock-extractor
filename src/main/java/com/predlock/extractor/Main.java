@@ -98,7 +98,7 @@ public class Main {
         // Phase 5: Generate deadlock analyzer input
         try {
             DeadlockAnalyzerInputGenerator generator = new DeadlockAnalyzerInputGenerator();
-            generator.generate(resolvedTransactions, 2, outputPath);
+            generator.generate(resolvedTransactions, 1, outputPath);
             System.out.println("Phase 5 done: deadlock-analyzer-input.json written");
         } catch (Exception e) {
             System.err.println("Phase 5 failed: " + e.getMessage());
